@@ -1,0 +1,5 @@
+{
+  "deploy": {
+    "app": "clevrsend-signaling"
+  }
+}

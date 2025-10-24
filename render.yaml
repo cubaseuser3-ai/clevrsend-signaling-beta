@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: clevrsend-signaling
+    env: docker
+    runtime: image
+    dockerCommand: deno run --allow-net signaling-server.ts
+    healthCheckPath: /health
+    plan: free
+    autoDeploy: true
+    buildCommand: echo "No build needed"
+    startCommand: deno run --allow-net signaling-server.ts
