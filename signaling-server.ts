@@ -6,7 +6,7 @@
  * URL: wss://clevrsend-signaling-beta.onrender.com
  */
 
-const SERVER_VERSION = "1.6.0-beta.1";
+const SERVER_VERSION = "1.7.0-beta.1";
 
 interface ClientInfo {
   alias: string;
@@ -33,6 +33,53 @@ interface StoredOffer {
   timestamp: number;
 }
 const qrOffers = new Map<string, StoredOffer>();
+
+// ===== ROOM MANAGEMENT =====
+interface RoomDevice {
+  id: string;
+  name: string;
+  type: string;
+  lastSeen: number;
+  peerId: string; // Socket ID for communication
+}
+
+interface Room {
+  code: string;
+  devices: Map<string, RoomDevice>;
+  createdAt: number;
+}
+
+const rooms = new Map<string, Room>();
+
+// Cleanup inactive devices every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  const INACTIVE_THRESHOLD = 2 * 60 * 1000; // 2 minutes
+
+  for (const [roomCode, room] of rooms.entries()) {
+    for (const [deviceId, device] of room.devices.entries()) {
+      if (now - device.lastSeen > INACTIVE_THRESHOLD) {
+        console.log(`🧹 Removing inactive device ${device.name} from room ${roomCode}`);
+        room.devices.delete(deviceId);
+
+        // Broadcast device left
+        broadcastToRoom(roomCode, {
+          type: 'device-left',
+          device: {
+            id: deviceId,
+            name: device.name,
+          }
+        });
+      }
+    }
+
+    // Remove empty rooms
+    if (room.devices.size === 0 && now - room.createdAt > INACTIVE_THRESHOLD) {
+      console.log(`🧹 Removing empty room ${roomCode}`);
+      rooms.delete(roomCode);
+    }
+  }
+}, 2 * 60 * 1000);
 
 // ===== SECURITY: Rate Limiting =====
 interface RateLimitRecord {
@@ -104,6 +151,121 @@ function decrementConnectionCount(ip: string): void {
   if (count > 0) {
     connectionLimits.set(ip, count - 1);
   }
+}
+
+// ===== ROOM HELPER FUNCTIONS =====
+
+/**
+ * Broadcast message to all devices in a room
+ */
+function broadcastToRoom(roomCode: string, message: any, excludeDeviceId?: string) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+
+  for (const [deviceId, device] of room.devices.entries()) {
+    if (excludeDeviceId && deviceId === excludeDeviceId) continue;
+
+    const client = clients.get(device.peerId);
+    if (client && client.socket.readyState === WebSocket.OPEN) {
+      try {
+        client.socket.send(JSON.stringify(message));
+      } catch (err) {
+        console.error(`Failed to send to device ${deviceId}:`, err);
+      }
+    }
+  }
+}
+
+/**
+ * Join a room
+ */
+function joinRoom(roomCode: string, device: Omit<RoomDevice, 'lastSeen'>, peerId: string) {
+  let room = rooms.get(roomCode);
+
+  // Create room if it doesn't exist
+  if (!room) {
+    room = {
+      code: roomCode,
+      devices: new Map(),
+      createdAt: Date.now()
+    };
+    rooms.set(roomCode, room);
+    console.log(`🏠 Created new room: ${roomCode}`);
+  }
+
+  // Add or update device
+  const roomDevice: RoomDevice = {
+    ...device,
+    peerId,
+    lastSeen: Date.now()
+  };
+
+  const isNewDevice = !room.devices.has(device.id);
+  room.devices.set(device.id, roomDevice);
+
+  console.log(`📱 ${device.name} ${isNewDevice ? 'joined' : 'updated in'} room ${roomCode}`);
+
+  // Broadcast to room that device joined
+  if (isNewDevice) {
+    broadcastToRoom(roomCode, {
+      type: 'device-joined',
+      device: {
+        id: device.id,
+        name: device.name,
+        type: device.type
+      }
+    }, device.id);
+  }
+
+  // Send current device list to the joining device
+  return Array.from(room.devices.values()).map(d => ({
+    id: d.id,
+    name: d.name,
+    type: d.type,
+    lastSeen: d.lastSeen
+  }));
+}
+
+/**
+ * Leave a room
+ */
+function leaveRoom(roomCode: string, deviceId: string) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+
+  const device = room.devices.get(deviceId);
+  if (!device) return;
+
+  room.devices.delete(deviceId);
+  console.log(`👋 ${device.name} left room ${roomCode}`);
+
+  // Broadcast device left
+  broadcastToRoom(roomCode, {
+    type: 'device-left',
+    device: {
+      id: deviceId,
+      name: device.name
+    }
+  });
+
+  // Remove empty room
+  if (room.devices.size === 0) {
+    rooms.delete(roomCode);
+    console.log(`🧹 Removed empty room ${roomCode}`);
+  }
+}
+
+/**
+ * Update device heartbeat
+ */
+function updateDeviceHeartbeat(roomCode: string, deviceId: string) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+
+  const device = room.devices.get(deviceId);
+  if (!device) return;
+
+  device.lastSeen = Date.now();
 }
 
 // ===== SECURITY: CORS Whitelist =====
@@ -426,6 +588,15 @@ Deno.serve({ port: 8080 }, (req) => {
       // Decrement connection count for this IP
       decrementConnectionCount(client.ip);
 
+      // Remove from all rooms
+      for (const [roomCode, room] of rooms.entries()) {
+        for (const [deviceId, device] of room.devices.entries()) {
+          if (device.peerId === clientId) {
+            leaveRoom(roomCode, deviceId);
+          }
+        }
+      }
+
       clients.delete(clientId);
 
       // Notify all other clients about the peer leaving
@@ -516,6 +687,41 @@ function handleMessage(senderId: string, message: any, sender: Client) {
         console.log(`Forwarded ICE_CANDIDATE from ${senderId} to ${message.targetId}`);
       } else {
         console.warn(`ICE_CANDIDATE target ${message.targetId} not found or not ready`);
+      }
+      break;
+
+    case "join-room":
+      // Join a room
+      try {
+        const devices = joinRoom(message.roomCode, message.device, senderId);
+        sender.socket.send(JSON.stringify({
+          type: "room-devices",
+          devices: devices
+        }));
+      } catch (err) {
+        console.error(`Error joining room:`, err);
+        sender.socket.send(JSON.stringify({
+          type: "error",
+          message: "Failed to join room"
+        }));
+      }
+      break;
+
+    case "leave-room":
+      // Leave a room
+      try {
+        leaveRoom(message.roomCode, message.deviceId);
+      } catch (err) {
+        console.error(`Error leaving room:`, err);
+      }
+      break;
+
+    case "room-heartbeat":
+      // Update device heartbeat
+      try {
+        updateDeviceHeartbeat(message.roomCode, message.deviceId);
+      } catch (err) {
+        console.error(`Error updating heartbeat:`, err);
       }
       break;
 
